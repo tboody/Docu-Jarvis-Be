@@ -1,0 +1,33 @@
+[tool.poetry]
+name = "docu-jarvis-be"
+version = "0.1.0"
+description = "FastAPI backend for the Docu-Jarvis AI code analysis platform"
+authors = ["Docu-Jarvis"]
+readme = "README.md"
+package-mode = false
+
+[tool.poetry.dependencies]
+python = "^3.11"
+fastapi = "^0.115.0"
+uvicorn = { extras = ["standard"], version = "^0.32.0" }
+pydantic = "^2.9.0"
+pydantic-settings = "^2.6.0"
+python-dotenv = "^1.0.0"
+gitpython = "^3.1.43"
+beautifulsoup4 = "^4.12.3"
+aiofiles = "^24.1.0"
+httpx = "^0.28.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^8.3.0"
+pytest-asyncio = "^0.24.0"
+httpx = "^0.28.0"
+ruff = "^0.7.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
