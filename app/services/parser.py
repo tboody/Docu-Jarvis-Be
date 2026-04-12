@@ -32,7 +32,8 @@ def _kv_map(soup: BeautifulSoup) -> dict[str, str]:
         key_el = row.select_one(".key")
         val_el = row.select_one(".val")
         if key_el and val_el:
-            key = _text(key_el).lower().replace(" ", "_").rstrip(":")
+            # Strip trailing punctuation like ":" and "?" from key labels
+            key = _text(key_el).lower().replace(" ", "_").rstrip(":?")
             result[key] = _text(val_el)
     return result
 
@@ -58,27 +59,83 @@ def _to_int(v: str | None, default: int = 0) -> int:
 
 # ── Security ──────────────────────────────────────────────────────────────────
 
+def _parse_meta(meta: str) -> tuple[str, int, str, str]:
+    """Parse a finding .meta line: 'path/file.go:42 · CATEGORY (via rule)'"""
+    parts = meta.split(" · ", 1)
+    file_part = parts[0].strip()
+    cat_part = parts[1].strip() if len(parts) > 1 else ""
+
+    # file:line
+    if ":" in file_part:
+        file_path, _, line_str = file_part.rpartition(":")
+        line_num = _to_int(line_str)
+    else:
+        file_path, line_num = file_part, 0
+
+    # category (via detected_by)
+    detected_by = ""
+    if " (via " in cat_part:
+        category, _, rest = cat_part.partition(" (via ")
+        detected_by = rest.rstrip(")")
+    else:
+        category = cat_part
+
+    return file_path, line_num, category.strip(), detected_by.strip()
+
+
 def _parse_security(soup: BeautifulSoup, raw_html: str) -> dict[str, Any]:
     kv = _kv_map(soup)
 
+    # ── Severity counts ───────────────────────────────────────────────────────
+    # Counts live in summary badge spans like <span class="badge sev-high">HIGH 6</span>
+    # which are OUTSIDE .finding divs. Finding badges have no number.
+    critical = high = medium = low = 0
+    for badge in soup.select(".badge"):
+        # Skip badges that are inside a .finding element
+        if badge.find_parent(class_="finding"):
+            continue
+        text = _text(badge)
+        m = re.match(r"^(CRITICAL|HIGH|MEDIUM|LOW)\s+(\d+)$", text, re.IGNORECASE)
+        if m:
+            sev, cnt = m.group(1).upper(), int(m.group(2))
+            if sev == "CRITICAL":
+                critical = cnt
+            elif sev == "HIGH":
+                high = cnt
+            elif sev == "MEDIUM":
+                medium = cnt
+            elif sev == "LOW":
+                low = cnt
+
+    # ── Findings ──────────────────────────────────────────────────────────────
     findings_data: list[dict] = []
     for idx, f_el in enumerate(soup.select(".finding")):
-        # Each finding card has kv rows inside it
-        fkv = {}
-        for row in f_el.select(".kv"):
-            k_el = row.select_one(".key")
-            v_el = row.select_one(".val")
-            if k_el and v_el:
-                k = _text(k_el).lower().replace(" ", "_").rstrip(":")
-                fkv[k] = _text(v_el)
-
+        # Severity from badge inside .title
         badge_el = f_el.select_one(".badge")
-        severity = _text(badge_el).upper() if badge_el else fkv.get("severity", "LOW")
+        severity = _text(badge_el).upper() if badge_el else "LOW"
+        # Strip any trailing count suffix (shouldn't be there, but be safe)
+        severity = severity.split()[0] if severity else "LOW"
 
+        # Title from .title div — strip the leading badge text
+        title = ""
+        title_el = f_el.select_one(".title")
+        if title_el:
+            full = title_el.get_text(strip=True)
+            if badge_el:
+                badge_text = _text(badge_el)
+                title = full[len(badge_text):].strip()
+            else:
+                title = full
+
+        # File, line, category, detected_by from .meta div
+        meta_el = f_el.select_one(".meta")
+        file_path, line_num, category, detected_by = _parse_meta(_text(meta_el) if meta_el else "")
+
+        # Snippet
         snippet_el = f_el.select_one("pre, code")
         snippet = _text(snippet_el) if snippet_el else ""
 
-        # AI sections inside the finding
+        # AI narrative sections inside the finding
         sections: dict[str, str] = {}
         for sec in f_el.select(".section"):
             h = sec.select_one("h3")
@@ -88,27 +145,36 @@ def _parse_security(soup: BeautifulSoup, raw_html: str) -> dict[str, Any]:
 
         findings_data.append(
             {
-                "id": fkv.get("id", f"finding-{idx}"),
-                "rule_id": fkv.get("rule", fkv.get("rule_id", "unknown")),
-                "category": fkv.get("owasp", fkv.get("category", "")),
+                "id": f"finding-{idx}",
+                "rule_id": category or f"finding-{idx}",
+                "category": category,
                 "severity": severity,
-                "title": fkv.get("title", ""),
-                "file": fkv.get("file", ""),
-                "line": _to_int(fkv.get("line")),
+                "title": title,
+                "file": file_path,
+                "line": line_num,
                 "snippet": snippet,
-                "description": sections.get("description", fkv.get("description", "")),
+                "description": sections.get("description", ""),
                 "explanation": sections.get("explanation", ""),
-                "why_dangerous": sections.get("why dangerous", sections.get("why_dangerous", "")),
-                "how_to_fix": sections.get("how to fix", sections.get("how_to_fix", "")),
-                "detected_by": fkv.get("detected_by", "pattern"),
+                "why_dangerous": sections.get("why dangerous", sections.get("why dangerous", "")),
+                "how_to_fix": sections.get("how to fix", sections.get("how to fix", "")),
+                "detected_by": detected_by or "pattern",
             }
         )
 
-    critical = _to_int(kv.get("critical"))
-    high = _to_int(kv.get("high"))
-    medium = _to_int(kv.get("medium"))
-    low = _to_int(kv.get("low"))
-    total = critical + high + medium + low or _to_int(kv.get("findings"))
+    # Fall back to counting findings if badges were absent
+    if critical + high + medium + low == 0 and findings_data:
+        for f in findings_data:
+            sev = f["severity"]
+            if sev == "CRITICAL":
+                critical += 1
+            elif sev == "HIGH":
+                high += 1
+            elif sev == "MEDIUM":
+                medium += 1
+            elif sev == "LOW":
+                low += 1
+
+    total = critical + high + medium + low or _to_int(kv.get("findings")) or len(findings_data)
 
     return {
         "files_scanned": _to_int(kv.get("files_scanned")),
@@ -130,13 +196,33 @@ def _parse_impact(soup: BeautifulSoup, raw_html: str) -> dict[str, Any]:
     kv = _kv_map(soup)
     sections = _section_map(soup)
 
+    # ── Risk level & score live in .risk-bar, not in .kv rows ────────────────
+    # Template: <span class="badge sev-medium">MEDIUM</span> ... <span>36/100</span>
+    risk_level = "UNKNOWN"
+    risk_score = 0
+    risk_bar = soup.select_one(".risk-bar")
+    if risk_bar:
+        badge = risk_bar.select_one(".badge")
+        if badge:
+            risk_level = _text(badge).upper().strip()
+            # Normalise double-prefix artefact: "SEV-MEDIUM" → "MEDIUM"
+            for prefix in ("SEV-", "SEV_"):
+                if risk_level.startswith(prefix):
+                    risk_level = risk_level[len(prefix):]
+        for span in risk_bar.find_all("span"):
+            m = re.search(r"(\d+)/100", _text(span))
+            if m:
+                risk_score = int(m.group(1))
+                break
+
     return {
-        "risk_level": kv.get("risk_level", kv.get("risk", "UNKNOWN")).upper(),
-        "risk_score": _to_int(kv.get("risk_score")),
+        "risk_level": risk_level,
+        "risk_score": risk_score,
         "direct_callers": _to_int(kv.get("direct_callers")),
         "total_callers": _to_int(kv.get("total_callers")),
         "max_graph_depth": _to_int(kv.get("max_graph_depth")),
-        "affected_packages": _to_int(kv.get("affected_pkgs", kv.get("dependent_pkgs"))),
+        # Template key is "Affected Packages" → normalised to "affected_packages"
+        "affected_packages": _to_int(kv.get("affected_packages", kv.get("affected_pkgs", kv.get("dependent_pkgs")))),
         "critical_systems": [
             s.strip()
             for s in kv.get("critical_systems", "").split(",")
@@ -144,14 +230,16 @@ def _parse_impact(soup: BeautifulSoup, raw_html: str) -> dict[str, Any]:
         ],
         "has_tests": "present" in kv.get("test_coverage", "").lower(),
         "what_changing": sections.get("what_this_code_does", ""),
-        "direct_impact": sections.get("direct_impact__depth_1_callers_", sections.get("direct_impact", "")),
+        "direct_impact": sections.get("direct_impact", ""),
         "indirect_impact": sections.get("indirect___transitive_impact", sections.get("indirect_impact", "")),
-        "critical_paths": sections.get("critical_call_chains", sections.get("critical_paths", "")),
-        "safety_net": sections.get("safety_net___circuit_breakers", sections.get("safety_net", "")),
+        # Template heading: "Critical Call Paths" → normalised key
+        "critical_paths": sections.get("critical_call_paths", sections.get("critical_call_chains", sections.get("critical_paths", ""))),
+        "safety_net": sections.get("safety_net", sections.get("safety_net___circuit_breakers", "")),
         "risk_assessment": sections.get("risk_assessment", ""),
         "testing_strategy": sections.get("testing_strategy", ""),
         "next_steps": sections.get("recommended_next_steps", sections.get("next_steps", "")),
-        "unknowns": sections.get("unknowns___gaps", sections.get("unknowns", "")),
+        # Template heading: "Unknowns / Uncertainty" → normalised key
+        "unknowns": sections.get("unknowns___uncertainty", sections.get("unknowns___gaps", sections.get("unknowns", ""))),
         "raw_html": raw_html,
     }
 
@@ -162,19 +250,34 @@ def _parse_why(soup: BeautifulSoup, raw_html: str) -> dict[str, Any]:
     kv = _kv_map(soup)
     sections = _section_map(soup)
 
+    # confidence_score is embedded in the confidence value: "HIGH (9/10)"
+    confidence_val = kv.get("confidence", "")
+    confidence_score = 0
+    confidence_clean = confidence_val
+    m = re.search(r"\((\d+)/", confidence_val)
+    if m:
+        confidence_score = int(m.group(1))
+        confidence_clean = re.sub(r"\s*\(.*?\)", "", confidence_val).strip()
+
     return {
         "classification": kv.get("classification", ""),
-        "confidence": kv.get("confidence", ""),
-        "confidence_score": _to_int(kv.get("confidence_score")),
+        "confidence": confidence_clean,
+        "confidence_score": confidence_score,
+        # _kv_map now strips "?" so "Still Needed?" → "still_needed" ✓
         "still_needed": kv.get("still_needed", "UNCERTAIN").upper(),
-        "risk_level": kv.get("removal_risk", kv.get("risk_level", "MEDIUM")).upper(),
-        "what_it_does": sections.get("what_it_does", ""),
-        "most_likely_reason": kv.get("most_likely_reason", ""),
-        "evidence_summary": sections.get("evidence_summary", ""),
-        "still_needed_reason": sections.get("still_needed_reason", sections.get("still_needed", "")),
-        "what_breaks": sections.get("what_breaks_if_removed", sections.get("what_breaks", "")),
+        "risk_level": kv.get("risk_level", kv.get("removal_risk", "MEDIUM")).upper(),
+        # Template section: "What This Code Does" → what_this_code_does
+        "what_it_does": sections.get("what_this_code_does", sections.get("what_it_does", "")),
+        # Template section: "Most Likely Reason It Exists" → most_likely_reason_it_exists
+        "most_likely_reason": sections.get("most_likely_reason_it_exists", sections.get("most_likely_reason", kv.get("most_likely_reason", ""))),
+        # Template section: "Evidence Used" → evidence_used
+        "evidence_summary": sections.get("evidence_used", sections.get("evidence_summary", "")),
+        "still_needed_reason": sections.get("still_needed_reason", ""),
+        # Template section: "What Could Break" → what_could_break
+        "what_breaks": sections.get("what_could_break", sections.get("what_breaks_if_removed", sections.get("what_breaks", ""))),
         "next_steps": sections.get("recommended_next_steps", sections.get("next_steps", "")),
-        "unknowns": sections.get("unknowns", ""),
+        # Template section: "Unknowns / Uncertainty" → unknowns___uncertainty
+        "unknowns": sections.get("unknowns___uncertainty", sections.get("unknowns___gaps", sections.get("unknowns", ""))),
         "total_commits": _to_int(kv.get("commits_analysed", kv.get("total_commits"))),
         "history_days": _to_int(kv.get("history_days")),
         "raw_html": raw_html,

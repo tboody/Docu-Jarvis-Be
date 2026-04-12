@@ -43,6 +43,8 @@ class AnalysisRequest(BaseModel):
     options: AnalysisOptions = AnalysisOptions()
     # User can supply their own API key; falls back to server .env
     api_key: Optional[str] = None
+    # Optional GitHub Personal Access Token for private repos
+    github_token: Optional[str] = None
 
     @field_validator("repo_url")
     @classmethod

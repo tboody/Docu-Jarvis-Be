@@ -19,12 +19,57 @@ logger = logging.getLogger(__name__)
 
 _ANSI = re.compile(r"\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])")
 
+# Braille + block spinner characters used by bubbletea/charmbracelet spinners
+_SPINNER_CHARS = frozenset("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟⣯⣷")
+
 # In-memory job registry (single-process; swap for Redis in production)
 _jobs: dict[str, "AnalysisJob"] = {}
 
 
 def strip_ansi(text: str) -> str:
     return _ANSI.sub("", text)
+
+
+def _make_spinner_filter(on_line):
+    """
+    Wraps *on_line* to:
+      1. Collapse bubbletea spinner frame spam (identical consecutive lines)
+      2. Detect Claude spending-cap / auth errors and surface a clear message
+    """
+    _last: list = [None]
+    _cap_seen: list = [False]
+
+    def filtered(line: str) -> None:
+        lower = line.lower()
+
+        # ── Spending cap / auth error detection ──────────────────────────────
+        if "spending cap" in lower or "spending cap reached" in lower:
+            _cap_seen[0] = True
+            on_line("✗ Claude usage limit reached — your spending cap has been hit. "
+                    "Visit https://claude.ai to increase your limit or wait for it to reset.")
+            return
+
+        # Generic CLI exit-code-1 error — enrich if we already saw cap message
+        if "cli process error (exit code 1)" in lower or "failed to read stderr" in lower:
+            if _cap_seen[0]:
+                on_line("✗ Analysis failed due to Claude spending cap (see above)")
+            else:
+                on_line("✗ Claude CLI error (exit code 1) — check that 'claude' is "
+                        "authenticated and your usage limit has not been reached")
+            return
+
+        # ── Spinner frame deduplication ───────────────────────────────────────
+        if line and line[0] in _SPINNER_CHARS:
+            content = line[1:].strip()
+            if content == _last[0]:
+                return  # duplicate frame — suppress
+            _last[0] = content
+            on_line(content or line)
+        else:
+            _last[0] = None
+            on_line(line)
+
+    return filtered
 
 
 class AnalysisJob:
@@ -98,11 +143,13 @@ def _build_cmd(mode: str, target: str, report_path: str, options: dict) -> list[
     raise AnalysisError(f"Unsupported mode: {mode}")
 
 
-def _run_with_pty(cmd: list[str], cwd: str, env: dict) -> tuple[int, list[str]]:
+def _run_with_pty(cmd: list[str], cwd: str, env: dict, on_line) -> int:
     """
     Run *cmd* inside a pseudo-TTY so bubbletea renders correctly.
-    Returns (returncode, list_of_clean_lines).
+    Calls *on_line(str)* for every clean output line in real-time.
+    Returns the exit code.
     """
+    on_line = _make_spinner_filter(on_line)  # collapse spinner frame spam
     try:
         import pty  # Unix only
 
@@ -118,31 +165,36 @@ def _run_with_pty(cmd: list[str], cwd: str, env: dict) -> tuple[int, list[str]]:
         )
         os.close(slave_fd)
 
-        lines: list[str] = []
         buf = b""
 
         while True:
             try:
                 readable, _, _ = select.select([master_fd], [], [], 0.2)
                 if readable:
-                    chunk = os.read(master_fd, 4096)
-                    if chunk:
-                        buf += chunk
-                        text = buf.decode("utf-8", errors="replace")
-                        clean = strip_ansi(text)
-                        if "\n" in clean:
-                            parts = clean.split("\n")
-                            for part in parts[:-1]:
-                                stripped = part.strip()
-                                if stripped:
-                                    lines.append(stripped)
-                            buf = parts[-1].encode("utf-8", errors="replace")
+                    try:
+                        chunk = os.read(master_fd, 4096)
+                    except OSError:
+                        # EIO — PTY slave closed (process exited on macOS/Linux)
+                        break
+                    if not chunk:
+                        # EOF on some systems
+                        break
+                    buf += chunk
+                    text = buf.decode("utf-8", errors="replace")
+                    clean = strip_ansi(text)
+                    # Split on \r or \n to handle carriage-return progress bars
+                    parts = re.split(r"\r|\n", clean)
+                    for part in parts[:-1]:
+                        stripped = part.strip()
+                        if stripped:
+                            on_line(stripped)
+                    buf = parts[-1].encode("utf-8")
                 else:
                     if proc.poll() is not None:
                         # Flush remaining buffer
-                        remaining = strip_ansi(buf.decode("utf-8", errors="replace"))
-                        if remaining.strip():
-                            lines.append(remaining.strip())
+                        remaining = strip_ansi(buf.decode("utf-8", errors="replace")).strip()
+                        if remaining:
+                            on_line(remaining)
                         break
             except OSError:
                 break
@@ -152,8 +204,7 @@ def _run_with_pty(cmd: list[str], cwd: str, env: dict) -> tuple[int, list[str]]:
         except OSError:
             pass
 
-        rc = proc.wait()
-        return rc, lines
+        return proc.wait()
 
     except ImportError:
         # Windows fallback — no pty available
@@ -165,12 +216,11 @@ def _run_with_pty(cmd: list[str], cwd: str, env: dict) -> tuple[int, list[str]]:
             env=env,
             timeout=settings.job_timeout,
         )
-        lines = [
-            strip_ansi(l).strip()
-            for l in (result.stdout + result.stderr).splitlines()
-            if l.strip()
-        ]
-        return result.returncode, lines
+        for line in (result.stdout + result.stderr).splitlines():
+            stripped = strip_ansi(line).strip()
+            if stripped:
+                on_line(stripped)
+        return result.returncode
 
 
 async def run_analysis(
@@ -182,7 +232,7 @@ async def run_analysis(
 ) -> None:
     """
     Async wrapper — runs the Go binary in a thread pool, streams
-    progress lines back through job.progress_queue.
+    progress lines back through job.progress_queue in real time.
     """
     from app.services.parser import parse_report
 
@@ -193,8 +243,14 @@ async def run_analysis(
     Path(report_path).parent.mkdir(parents=True, exist_ok=True)
     job.report_path = report_path
 
-    # Build env — pass API key to the Go binary
-    env = {**os.environ, "ANTHROPIC_API_KEY": api_key, "TERM": "xterm-256color"}
+    # Build env — pass repo URL to the Go binary.
+    # DO NOT set ANTHROPIC_API_KEY here: the Go binary calls the claude CLI
+    # which uses its own stored auth (~/.claude/).  Overriding with a raw
+    # API key breaks the claude CLI and causes exit-code-1 failures.
+    env = {**os.environ, "REPO_URL": job.repo_url, "TERM": "xterm-256color"}
+    # Expose token so the Go binary can use it for git operations if needed
+    if options.get("github_token"):
+        env["GITHUB_TOKEN"] = options["github_token"]
 
     try:
         cmd = _build_cmd(job.mode, target, report_path, options)
@@ -210,19 +266,23 @@ async def run_analysis(
     )
 
     def _send(line: str) -> None:
-        """Thread-safe progress push."""
+        """Thread-safe real-time progress push from worker thread."""
         loop.call_soon_threadsafe(
             job.progress_queue.put_nowait, {"type": "log", "text": line}
         )
 
-    def _run() -> tuple[int, list[str]]:
-        rc, lines = _run_with_pty(cmd, repo_path, env)
-        for ln in lines:
-            _send(ln)
-        return rc, lines
+    # Capture lines via closure so they're available after the executor finishes
+    output_lines: list[str] = []
+
+    def _run() -> int:
+        def on_line(line: str) -> None:
+            output_lines.append(line)
+            _send(line)  # stream each line to the client as it arrives
+
+        return _run_with_pty(cmd, repo_path, env, on_line)
 
     try:
-        rc, output_lines = await asyncio.wait_for(
+        rc = await asyncio.wait_for(
             loop.run_in_executor(None, _run),
             timeout=settings.job_timeout,
         )
@@ -237,6 +297,10 @@ async def run_analysis(
         job.error = str(exc)
         await job.progress_queue.put({"type": "done", "status": "failed"})
         return
+
+    # Yield to the event loop so all call_soon_threadsafe-scheduled put_nowait
+    # callbacks from _send() are processed BEFORE we enqueue the "done" event.
+    await asyncio.sleep(0)
 
     # Parse HTML report (security / impact / why) or use raw output
     html_path = Path(report_path)

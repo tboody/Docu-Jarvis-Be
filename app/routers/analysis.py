@@ -3,10 +3,15 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
+from datetime import datetime
 from pathlib import Path
 
+import git as _git
+import httpx
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 
 from app.core.config import settings
 from app.core.exceptions import BinaryNotFoundError, JobNotFoundError
@@ -19,19 +24,16 @@ router = APIRouter(prefix="/api/v1", tags=["analysis"])
 logger = logging.getLogger(__name__)
 
 
+class PushReportBody(BaseModel):
+    github_token: str
+    markdown_content: str
+
+
 @router.post("/analyze", response_model=JobResponse, status_code=202)
 async def start_analysis(body: AnalysisRequest, background_tasks: BackgroundTasks):
     # Validate binary exists
     if not Path(settings.docu_jarvis_binary).exists():
         raise BinaryNotFoundError(settings.docu_jarvis_binary)
-
-    api_key = body.api_key or settings.anthropic_api_key
-    if not api_key:
-        raise HTTPException(
-            status_code=422,
-            detail="An Anthropic API key is required. "
-            "Pass it in the request body or set ANTHROPIC_API_KEY on the server.",
-        )
 
     job = create_job(body.mode.value, body.repo_url)
     job.status = JobStatus.cloning
@@ -42,17 +44,20 @@ async def start_analysis(body: AnalysisRequest, background_tasks: BackgroundTask
             # Clone in thread pool to not block the event loop
             loop = asyncio.get_running_loop()
             repo_path = await loop.run_in_executor(
-                None, clone_repo, body.repo_url, job.job_id
+                None, clone_repo, body.repo_url, job.job_id, body.github_token
             )
             await job.progress_queue.put(
                 {"type": "status", "text": "Repository cloned. Starting analysis…"}
             )
+            opts = body.options.model_dump()
+            if body.github_token:
+                opts["github_token"] = body.github_token
             await run_analysis(
                 job=job,
                 repo_path=repo_path,
                 target=body.options.target,
-                api_key=api_key,
-                options=body.options.model_dump(),
+                api_key="",
+                options=opts,
             )
         except Exception as exc:
             logger.exception("Job %s failed", job.job_id)
@@ -112,3 +117,105 @@ async def delete_job(job_id: str):
     if job is None:
         raise JobNotFoundError(job_id)
     cleanup_job(job_id)
+
+
+_MODE_TO_FILE = {
+    "security": "docs/security-report.md",
+    "impact": "docs/impact-analysis.md",
+    "why": "docs/why-analysis.md",
+    "debug": "docs/debug-report.md",
+    "explain": "docs/commit-explanation.md",
+}
+
+
+@router.post("/jobs/{job_id}/push-to-repo")
+async def push_report_to_repo(job_id: str, body: PushReportBody):
+    """Convert analysis report to markdown, push branch, and open a PR."""
+    job = get_job(job_id)
+    if job is None:
+        raise JobNotFoundError(job_id)
+    if job.status != "completed":
+        raise HTTPException(status_code=400, detail="Job is not completed yet")
+
+    repo_path = Path(settings.temp_dir) / job_id / "repo"
+    if not repo_path.exists():
+        raise HTTPException(
+            status_code=410,
+            detail="Cloned repository is no longer available — please re-run the analysis first",
+        )
+
+    # Parse owner/repo from GitHub URL
+    match = re.match(r"https://github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", job.repo_url)
+    if not match:
+        raise HTTPException(status_code=400, detail="Cannot parse GitHub repository URL")
+    owner, repo_name = match.group(1), match.group(2)
+
+    file_path = _MODE_TO_FILE.get(job.mode, f"docs/{job.mode}-report.md")
+
+    gh_headers = {
+        "Authorization": f"token {body.github_token}",
+        "Accept": "application/vnd.github.v3+json",
+    }
+
+    # Get default branch
+    async with httpx.AsyncClient(timeout=20) as client:
+        info_resp = await client.get(
+            f"https://api.github.com/repos/{owner}/{repo_name}",
+            headers=gh_headers,
+        )
+    default_branch = (
+        info_resp.json().get("default_branch", "main") if info_resp.is_success else "main"
+    )
+
+    branch_name = f"codeflowai-{job.mode}-{datetime.now().strftime('%Y%m%d-%H%M')}"
+
+    # Git operations
+    try:
+        git_repo = _git.Repo(str(repo_path))
+        git_repo.git.checkout(default_branch)
+        git_repo.git.checkout("-b", branch_name)
+
+        full_path = repo_path / file_path
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(body.markdown_content, encoding="utf-8")
+
+        git_repo.git.add(file_path)
+        git_repo.git.config("user.email", "codeflowai@bot.local")
+        git_repo.git.config("user.name", "CodeFlowAI")
+        git_repo.git.commit("-m", f"docs: add {job.mode} analysis report by CodeFlowAI")
+
+        auth_remote = f"https://{body.github_token}@github.com/{owner}/{repo_name}.git"
+        git_repo.git.push(auth_remote, branch_name)
+    except _git.GitCommandError as exc:
+        raise HTTPException(status_code=500, detail=f"Git error: {exc.stderr.strip()[:300]}")
+
+    # Create PR
+    async with httpx.AsyncClient(timeout=30) as client:
+        pr_resp = await client.post(
+            f"https://api.github.com/repos/{owner}/{repo_name}/pulls",
+            headers=gh_headers,
+            json={
+                "title": f"[CodeFlowAI] {job.mode.replace('_', ' ').title()} Report",
+                "body": (
+                    f"Automated analysis report generated by **CodeFlowAI**.\n\n"
+                    f"**Mode:** `{job.mode}`  \n"
+                    f"**Repository:** {job.repo_url}  \n"
+                    f"**Generated:** {datetime.now().strftime('%Y-%m-%d %H:%M UTC')}\n\n"
+                    f"---\n*Report saved at `{file_path}`*"
+                ),
+                "head": branch_name,
+                "base": default_branch,
+            },
+        )
+
+    if pr_resp.status_code not in (200, 201):
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to create PR: {pr_resp.json().get('message', 'Unknown error')[:200]}",
+        )
+
+    return {
+        "pr_url": pr_resp.json()["html_url"],
+        "file_path": file_path,
+        "branch": branch_name,
+    }
