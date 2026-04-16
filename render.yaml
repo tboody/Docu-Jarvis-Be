@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: docu-jarvis-be
+    runtime: python
+    region: oregon
+    plan: free
+    repo: https://github.com/tboody/Docu-Jarvis-Be
+
+    buildCommand: pip install -r requirements.txt
+
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+
+    healthCheckPath: /health
+
+    autoDeploy: true
+
+    envVars:
+      - key: TEMP_DIR
+        value: /tmp/docu-jarvis
+      - key: CORS_ORIGINS
+        value: '["https://your-frontend-url.com"]'
+      - key: DOCU_JARVIS_BINARY
+        value: /opt/render/project/src/docu-jarvis
+      # Set ANTHROPIC_API_KEY in the Render dashboard as a secret
+      - key: ANTHROPIC_API_KEY
+        sync: false

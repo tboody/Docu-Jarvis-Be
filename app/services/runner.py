@@ -134,11 +134,16 @@ def _build_cmd(mode: str, target: str, report_path: str, options: dict) -> list[
         custom_prompt = options.get("custom_prompt", "")
         if custom_prompt:
             cmd += ["-custom", custom_prompt]
+        if options.get("docs_folder"):
+            cmd += ["-docs-folder", options["docs_folder"]]
         return cmd
 
     if mode == "write_docs":
         topics = options.get("docs_topics") or options.get("target", "all")
-        return [binary, "-write-docs", topics]
+        cmd = [binary, "-write-docs", topics]
+        if options.get("docs_folder"):
+            cmd += ["-docs-folder", options["docs_folder"]]
+        return cmd
 
     raise AnalysisError(f"Unsupported mode: {mode}")
 
@@ -247,7 +252,8 @@ async def run_analysis(
     # DO NOT set ANTHROPIC_API_KEY here: the Go binary calls the claude CLI
     # which uses its own stored auth (~/.claude/).  Overriding with a raw
     # API key breaks the claude CLI and causes exit-code-1 failures.
-    env = {**os.environ, "REPO_URL": job.repo_url, "TERM": "xterm-256color"}
+    # NO_INTERACTIVE=1 tells the binary to skip post-run prompts (browser, download, push).
+    env = {**os.environ, "REPO_URL": job.repo_url, "TERM": "xterm-256color", "NO_INTERACTIVE": "1"}
     # Expose token so the Go binary can use it for git operations if needed
     if options.get("github_token"):
         env["GITHUB_TOKEN"] = options["github_token"]

@@ -36,6 +36,9 @@ class AnalysisOptions(BaseModel):
     # write-docs mode — comma-separated topics
     docs_topics: Optional[str] = None
 
+    # update-docs / write-docs — folder inside repo containing documentation
+    docs_folder: Optional[str] = None
+
 
 class AnalysisRequest(BaseModel):
     repo_url: str
